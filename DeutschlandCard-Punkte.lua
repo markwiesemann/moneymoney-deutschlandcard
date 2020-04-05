@@ -24,27 +24,22 @@
 -- SOFTWARE.
 
 WebBanking {
-  version = 1.0,
+  version = 1.1,
   country = "de",
-  url = "http://deutschlandcard.de",
+  url = "https://www.deutschlandcard.de/",
   services = {"DeutschlandCard-Punkte"},
   description = "Deutschlandcard-Punkte"
 }
 
 -- global variables (used in various functions)
+local cardNumber
+local pin
 local connection
-local accountNumber
-local accessToken
+local headersWithToken
 
-local function GetHeaders()
-  return {
-    ["Authorization"] = "Bearer " .. accessToken,
-    ["Accept"] = "application/json"
-  }
-end
 
 local function GetTransactions(url, transactions)
-  content, _, _, _, headers = connection:request("GET", url, "", "application/json", GetHeaders())
+  content, _, _, _, headers = connection:request("GET", url, "", "application/json", headersWithToken)
   if (headers["Content-Length"] == "0") then
     error("API returned an error")
   end
@@ -64,23 +59,58 @@ local function GetTransactions(url, transactions)
   return fields["hasMoreResults"], fields["nextSearchParams"]
 end
 
+
 function SupportsBank(protocol, bankCode)
   return bankCode == "DeutschlandCard-Punkte" and protocol == ProtocolWebBanking
 end
 
-function InitializeSession(protocol, bankCode, username, username2, password, username3)
-  url = "https://www.deutschlandcard.de/api/v1/auth/connect/token"
-  postContent = '{"grant_type":"password","response_type":"id_token token","scope":"deutschlandcardapi offline_access","audience":"deutschlandcardapi","username":"' .. username .. '","password":"' .. password .. '"}'
-  postContentType = "application/json; charset=UTF-8"
 
-  connection = Connection()
-  content = connection:post(url, postContent, postContentType)
+function InitializeSession2(protocol, bankCode, step, credentials, interactive)
+  if step == 1 then
 
-  fields = JSON(content):dictionary()
+    -- Cache card number and PIN for step 2.
+    cardNumber = credentials[1]
+    pin = credentials[2]
 
-  accessToken = fields['access_token']
-  accountNumber = username
+    -- Load reCAPTCHA v3.
+    return {challenge="https://www.recaptcha.net/recaptcha/api.js?render=6Le2S9AUAAAAAD4SMzwje15-swuVJtwV9O1HyL9T"}
+
+  elseif step == 2 then
+
+    -- Create HTTPS connection object.
+    connection = Connection()
+    connection.language = "de-de"
+
+    -- Prepare HTTP headers.
+    headers = {}
+    headers["Accept"] = "application/json"
+    headers["x-recaptcha-v3"] = credentials[1]
+
+    -- Submit login form.
+    print("Submitting login form.")
+    local postContent = JSON():set{grant_type="password",response_type="id_token token",scope="deutschlandcardapi offline_access",audience="deutschlandcardapi",username=cardNumber,password=pin}:json()
+    local json = JSON(connection:request("POST", url .. "api/v1/auth/connect/token", postContent, "application/json", headers)):dictionary()
+
+    -- Check for login error.
+    local message = json["data"] and json["data"]["error_description"]
+    if message then
+      print("Response:", message)
+      if message == "invalid credential" then
+        return LoginFailed
+      end
+    end
+
+    -- Extract access token.
+    if not json["access_token"] then
+      return "Der Server von DeutschlandCard hat kein Access-Token übermittelt. Bitte versuchen Sie es später noch einmal."
+    else
+      headersWithToken = {}
+      headersWithToken["Accept"] = "application/json"
+      headersWithToken["Authorization"] = "Bearer " .. json["access_token"]
+    end
+  end
 end
+
 
 function EndSession()
   -- nothing to be done due to the token-based approach (=> the token will expire after an hour)
@@ -88,7 +118,7 @@ end
 
 function ListAccounts(knownAccounts)
   url = "https://www.deutschlandcard.de/api/v1/profile/memberinfo"
-  content, _, _, _, headers = connection:request("GET", url, "", "application/json", GetHeaders())
+  content, _, _, _, headers = connection:request("GET", url, "", "application/json", headersWithToken)
   if (headers["Content-Length"] == "0") then
     error("API returned an error")
   end
@@ -97,7 +127,7 @@ function ListAccounts(knownAccounts)
     {
       name = "DeutschlandCard",
       owner = fields["firstname"] .. " " .. fields["lastname"],
-      accountNumber = accountNumber,
+      accountNumber = cardNumber,
       currency = "EUR",
       type = AccountTypeOther
     }
@@ -106,7 +136,7 @@ end
 
 function RefreshAccount(account, since)
   url = "https://www.deutschlandcard.de/api/v1/profile/memberpoints"
-  content, _, _, _, headers = connection:request("GET", url, "", "application/json", GetHeaders())
+  content, _, _, _, headers = connection:request("GET", url, "", "application/json", headersWithToken)
   if (headers["Content-Length"] == "0") then
     error("API returned an error")
   end
@@ -120,7 +150,6 @@ function RefreshAccount(account, since)
 
   repeat
     url = "https://www.deutschlandcard.de/api/v1/profile/bookings?offset=" .. offset .. "&limit=" .. limit
-
     hasMoreResults, nextSearchParams = GetTransactions(url, transactions)
 
     if (hasMoreResults) then
